@@ -1,0 +1,113 @@
+# --- Configuration ---
+$PVWAURL = "https://your-pvwa-server.domain.com/PasswordVault"
+$CSVPath = "C:\scripts\accounts_to_delete.csv"
+$Username = "YourAdminUser"
+$Password = "YourPassword"
+$LogFile = "C:\scripts\delete_log_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+
+# --- 1. Login to CyberArk ---
+Write-Host "Authenticating to CyberArk..." -ForegroundColor Cyan
+$LogonURL = "$PVWAURL/API/auth/Cyberark/Logon"
+$Body = @{ username = $Username; password = $Password } | ConvertTo-Json
+
+try {
+    $Token = Invoke-RestMethod -Uri $LogonURL -Method Post -ContentType "application/json" -Body $Body
+    $Headers = @{ "Authorization" = $Token }
+    Write-Host "Login Successful." -ForegroundColor Green
+}
+catch {
+    Write-Error "Login Failed: $($_.Exception.Message)"
+    exit
+}
+
+# --- 2. Process CSV and Search/Delete ---
+$Results = @()
+
+if (Test-Path $CSVPath) {
+    $Accounts = Import-Csv $CSVPath
+    Write-Host "Processing $($Accounts.Count) entries from CSV..." -ForegroundColor Yellow
+    $Counter = 0
+    
+    foreach ($Row in $Accounts) {
+        $Counter++
+        $name = $Row.name
+        $safe = $Row.safe
+        $address = $Row.address
+        $userName = $Row.userName
+        
+        Write-Host "[$Counter/$($Accounts.Count)] Searching: $name in Safe: $safe..." -NoNewline
+        
+        # Build search query using correct CyberArk API filter syntax
+        $SearchFilter = "search=$userName $address"
+        if ($safe) { $SearchFilter += "&filter=safeName eq $safe" }
+        $SearchURL = "$PVWAURL/API/Accounts?$SearchFilter"
+        
+        try {
+            $SearchResponse = Invoke-RestMethod -Uri $SearchURL -Method Get -Headers $Headers
+            
+            # Filter for exact match
+            $MatchedAccount = $SearchResponse.value | Where-Object { 
+                (-not $name -or $_.name -eq $name) -and
+                (-not $safe -or $_.safeName -eq $safe) -and
+                (-not $address -or $_.address -eq $address) -and
+                (-not $userName -or $_.userName -eq $userName)
+            }
+            
+            if ($MatchedAccount) {
+                if ($MatchedAccount.Count -gt 1) {
+                    Write-Host " Multiple matches ($($MatchedAccount.Count)). Skipping." -ForegroundColor Yellow
+                    $Results += [PSCustomObject]@{
+                        name = $name; safe = $safe; address = $address; userName = $userName
+                        AccountID = "N/A"; Status = "Skipped - Multiple Matches"
+                        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    }
+                    continue
+                }
+                
+                $AccountID = $MatchedAccount.id
+                Invoke-RestMethod -Uri "$PVWAURL/API/Accounts/$AccountID" -Method Delete -Headers $Headers
+                Write-Host " Deleted (ID: $AccountID)" -ForegroundColor Green
+                
+                $Results += [PSCustomObject]@{
+                    name = $name; safe = $safe; address = $address; userName = $userName
+                    AccountID = $AccountID; Status = "Deleted"
+                    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                }
+            }
+            else {
+                Write-Host " Not Found" -ForegroundColor Red
+                $Results += [PSCustomObject]@{
+                    name = $name; safe = $safe; address = $address; userName = $userName
+                    AccountID = "N/A"; Status = "Not Found"
+                    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                }
+            }
+        }
+        catch {
+            Write-Host " Error: $($_.Exception.Message)" -ForegroundColor Red
+            $Results += [PSCustomObject]@{
+                name = $name; safe = $safe; address = $address; userName = $userName
+                AccountID = "N/A"; Status = "Error: $($_.Exception.Message)"
+                Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
+        }
+    }
+    
+    $Results | Export-Csv -Path $LogFile -NoTypeInformation
+    Write-Host "`nLog exported: $LogFile" -ForegroundColor Cyan
+}
+else {
+    Write-Error "CSV file not found at $CSVPath"
+}
+
+# --- 3. Summary ---
+Write-Host "`n=== SUMMARY ===" -ForegroundColor Cyan
+Write-Host "Deleted  : $(($Results | Where-Object {$_.Status -eq 'Deleted'}).Count)" -ForegroundColor Green
+Write-Host "Not Found: $(($Results | Where-Object {$_.Status -eq 'Not Found'}).Count)" -ForegroundColor Red
+Write-Host "Skipped  : $(($Results | Where-Object {$_.Status -like 'Skipped*'}).Count)" -ForegroundColor Yellow
+Write-Host "Errors   : $(($Results | Where-Object {$_.Status -like 'Error*'}).Count)" -ForegroundColor Red
+
+# --- 4. Logout ---
+Write-Host "`nLogging out..." -ForegroundColor Cyan
+Invoke-RestMethod -Uri "$PVWAURL/API/auth/Logoff" -Method Post -Headers $Headers
+Write-Host "Session closed." -ForegroundColor Green
