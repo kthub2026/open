@@ -291,3 +291,4 @@ $results | Export-Csv -Path $resultsPath -NoTypeInformation
 Write-LogMessage -Message "Results exported to: $resultsPath" -Type Info
 
 #endregion Main Script
+.\Add-AccountGroups.ps1 -PVWAURL "https://pvwa.domain.com/PasswordVault" -CSVPath ".\AccountGroups.csv"
