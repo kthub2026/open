@@ -1,0 +1,179 @@
+param(
+    [Parameter(Mandatory=$true)][string]$PVWAURL,
+    [Parameter(Mandatory=$true)][string]$CsvPath,
+    [Parameter(Mandatory=$true)][pscredential]$Credential
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function UrlEncode([string]$s) { return [System.Uri]::EscapeDataString($s) }
+
+function Get-RowValue {
+    param(
+        [Parameter(Mandatory=$true)][pscustomobject]$Row,
+        [Parameter(Mandatory=$true)][string[]]$Candidates
+    )
+    foreach ($c in $Candidates) {
+        if ($Row.PSObject.Properties.Name -contains $c) {
+            $v = [string]$Row.$c
+            if (-not [string]::IsNullOrWhiteSpace($v)) { return $v.Trim() }
+        }
+    }
+    return $null
+}
+
+function Resolve-AccountIdFromAttributes {
+    param(
+        [Parameter(Mandatory=$true)][string]$PVWAURL,
+        [Parameter(Mandatory=$true)][hashtable]$Headers,
+        [Parameter(Mandatory=$true)][pscustomobject]$Row
+    )
+
+    # Accept multiple header names for the same concept
+    $safeName   = Get-RowValue -Row $Row -Candidates @("safeName","SafeName","safe","Safe")
+    $name       = Get-RowValue -Row $Row -Candidates @("name","Name","objectName","ObjectName","object","Object","AccountName","accountName")
+    $userName   = Get-RowValue -Row $Row -Candidates @("userName","UserName","username","Username","user","User")
+    $address    = Get-RowValue -Row $Row -Candidates @("address","Address","machine","Machine","host","Host","endpoint","Endpoint")
+    $platformId = Get-RowValue -Row $Row -Candidates @("platformId","PlatformId","platform","Platform")
+
+    if ([string]::IsNullOrWhiteSpace($safeName)) { throw "Missing required field: safeName" }
+    if ([string]::IsNullOrWhiteSpace($name))     { throw "Missing required field: name (or objectName)" }
+
+    # Build a filter. Start strict enough to uniquely identify.
+    # Safe + Name are used always. Add other fields if present.
+    $parts = @()
+    $parts += "safeName = $safeName"
+    $parts += "name Contains $name"
+
+    if ($userName)   { $parts += "userName Contains $userName" }
+    if ($address)    { $parts += "address Contains $address" }
+    if ($platformId) { $parts += "platformId Contains $platformId" }
+
+    $filter = ($parts -join " AND ")
+
+    $uri = "$PVWAURL/API/Accounts?limit=100&filter=$(UrlEncode($filter))"
+    $resp = Invoke-RestMethod -Method Get -Uri $uri -Headers $Headers -ContentType "application/json"
+
+    $items = @()
+    if ($null -ne $resp.value) { $items = @($resp.value) }
+    elseif ($resp -is [System.Array]) { $items = @($resp) }
+    else { $items = @($resp) }
+
+    if ($items.Count -eq 0) {
+        throw "No account found for filter: $filter"
+    }
+
+    # If multiple found, try to pick the best match using exact comparisons where possible.
+    $best = $items | Where-Object {
+        ($_.safeName -eq $safeName) -and
+        ($_.name -eq $name -or $_.name -like "*$name*") -and
+        ((-not $userName)   -or ($_.userName -eq $userName)) -and
+        ((-not $address)    -or ($_.address -eq $address)) -and
+        ((-not $platformId) -or ($_.platformId -eq $platformId))
+    }
+
+    $chosen = if ($best.Count -ge 1) { $best[0] } else { $items[0] }
+
+    if (-not $chosen.id) { throw "Matched account but response did not include id." }
+    return @{
+        Id = [string]$chosen.id
+        FilterUsed = $filter
+        Matches = $items.Count
+    }
+}
+
+# Normalize PVWA URL
+$PVWAURL = $PVWAURL.TrimEnd("/")
+
+Write-Host ""
+Write-Host "Bulk Delete Started (Attribute Based)" -ForegroundColor Green
+Write-Host "PVWAURL : $PVWAURL"
+Write-Host "CSV     : $CsvPath"
+Write-Host ""
+
+$rows = Import-Csv -LiteralPath $CsvPath
+if (-not $rows -or $rows.Count -eq 0) { throw "CSV is empty: $CsvPath" }
+
+# Logon
+$logonUri  = "$PVWAURL/API/auth/Cyberark/Logon/"
+$logonBody = @{
+    username = $Credential.UserName
+    password = $Credential.GetNetworkCredential().Password
+} | ConvertTo-Json
+
+Write-Host "Logging on to PVWA REST API..." -ForegroundColor Cyan
+$token = Invoke-RestMethod -Method Post -Uri $logonUri -Body $logonBody -ContentType "application/json"
+if ([string]::IsNullOrWhiteSpace([string]$token)) { throw "Logon did not return a token." }
+
+$headers = @{ Authorization = [string]$token }
+
+$results = New-Object System.Collections.Generic.List[object]
+
+try {
+    $i = 0
+    foreach ($r in $rows) {
+        $i++
+        $accountId = $null
+        $filterUsed = $null
+        $matches = $null
+
+        try {
+            $resolved = Resolve-AccountIdFromAttributes -PVWAURL $PVWAURL -Headers $headers -Row $r
+            $accountId = $resolved.Id
+            $filterUsed = $resolved.FilterUsed
+            $matches = $resolved.Matches
+
+            # Safety: if multiple matches, fail instead of guessing (prevents deleting wrong account)
+            if ($matches -gt 1) {
+                throw "Multiple matches ($matches). Add more attributes (userName/address/platformId) to uniquely identify. Filter: $filterUsed"
+            }
+
+            $delUri = "$PVWAURL/API/Accounts/$accountId/"
+            Invoke-RestMethod -Method Delete -Uri $delUri -Headers $headers -ContentType "application/json" | Out-Null
+
+            Write-Host "[$i] Deleted: $accountId" -ForegroundColor Green
+
+            $results.Add([pscustomobject]@{
+                Row        = $i
+                SafeName   = (Get-RowValue -Row $r -Candidates @("safeName","SafeName","safe","Safe"))
+                Name       = (Get-RowValue -Row $r -Candidates @("name","Name","objectName","ObjectName","AccountName","accountName"))
+                AccountId  = $accountId
+                Matches    = $matches
+                Status     = "Deleted"
+                Error      = $null
+            })
+        }
+        catch {
+            Write-Host "[$i] Failed: $($_.Exception.Message)" -ForegroundColor Red
+
+            $results.Add([pscustomobject]@{
+                Row        = $i
+                SafeName   = (Get-RowValue -Row $r -Candidates @("safeName","SafeName","safe","Safe"))
+                Name       = (Get-RowValue -Row $r -Candidates @("name","Name","objectName","ObjectName","AccountName","accountName"))
+                AccountId  = $accountId
+                Matches    = $matches
+                Status     = "Failed"
+                Error      = $_.Exception.Message
+            })
+        }
+    }
+}
+finally {
+    # Logoff
+    try {
+        Write-Host "Logging off..." -ForegroundColor Cyan
+        Invoke-RestMethod -Method Post -Uri "$PVWAURL/API/Auth/Logoff/" -Headers $headers -ContentType "application/json" | Out-Null
+    } catch {
+        Write-Host "Logoff failed (non-fatal)." -ForegroundColor Yellow
+    }
+}
+
+# Export results
+$outPath = Join-Path -Path (Split-Path -Parent $CsvPath) -ChildPath ("delete_results_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$results | Export-Csv -NoTypeInformation -LiteralPath $outPath
+
+Write-Host ""
+Write-Host "Bulk Delete Completed." -ForegroundColor Green
+Write-Host "Results exported to: $outPath" -ForegroundColor Cyan
+Write-Host ""
