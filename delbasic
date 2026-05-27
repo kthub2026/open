@@ -1,0 +1,67 @@
+# --- Configuration ---
+$PVWAURL = "https://your-pvwa-server.domain.com/PasswordVault"
+$CSVPath = "C:\scripts\accounts_to_delete.csv"
+$Username = "YourAdminUser"
+$Password = "YourPassword"
+
+# --- 1. Login to CyberArk ---
+Write-Host "Authenticating to CyberArk..." -ForegroundColor Cyan
+$LogonURL = "$PVWAURL/API/auth/Cyberark/Logon"
+$Body = @{ username = $Username; password = $Password } | ConvertTo-Json
+
+try {
+    $Token = Invoke-RestMethod -Uri $LogonURL -Method Post -ContentType "application/json" -Body $Body
+    $Headers = @{ "Authorization" = $Token }
+    Write-Host "Login Successful." -ForegroundColor Green
+}
+catch {
+    Write-Error "Login Failed: $($_.Exception.Message)"
+    exit
+}
+
+# --- 2. Process CSV and Search/Delete ---
+if (Test-Path $CSVPath) {
+    $Accounts = Import-Csv $CSVPath
+    Write-Host "Processing $($Accounts.Count) entries from CSV..." -ForegroundColor Yellow
+
+    foreach ($Row in $Accounts) {
+        $AccountName = $Row.AccountName  # Ensure your CSV header matches this
+
+        # Search for the Account ID using the Name
+        Write-Host "Searching for Account: $AccountName..." -NoNewline
+        $SearchURL = "$PVWAURL/API/Accounts?search=$AccountName"
+
+        try {
+            $SearchResponse = Invoke-RestMethod -Uri $SearchURL -Method Get -Headers $Headers
+
+            # Filter results for an exact name match
+            $MatchedAccount = $SearchResponse.value | Where-Object { $_.name -eq $AccountName }
+
+            if ($MatchedAccount) {
+                $AccountID = $MatchedAccount.id
+                $DeleteURL = "$PVWAURL/API/Accounts/$AccountID"
+
+                # Perform Deletion
+                Invoke-RestMethod -Uri $DeleteURL -Method Delete -Headers $Headers
+                Write-Host " Found ID $AccountID and Deleted Successfully." -ForegroundColor Green
+            }
+            else {
+                Write-Host " Not Found (Exact Match)." -ForegroundColor Red
+            }
+        }
+        catch {
+            Write-Host " Error during processing: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+}
+else {
+    Write-Error "CSV file not found at $CSVPath"
+}
+
+# --- 3. Logout ---
+Write-Host "Logging out..." -ForegroundColor Cyan
+$LogoffURL = "$PVWAURL/API/auth/Logoff"
+Invoke-RestMethod -Uri $LogoffURL -Method Post -Headers $Headers
+Write-Host "Session closed." -ForegroundColor Green
+
+#convert the delete script in this same format
