@@ -1,0 +1,188 @@
+# --- Configuration ---
+$PVWAURL = "https://your-pvwa-server.domain.com/PasswordVault"
+$CSVPath = "C:\scripts\accounts_to_delete.csv"
+$LogFile = "C:\scripts\delete_log_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+
+# Optional: change to LDAP/RADIUS if required
+$AuthType = "CyberArk"
+
+# --- Login ---
+Write-Host "Authenticating to CyberArk..." -ForegroundColor Cyan
+
+$Credential = Get-Credential -Message "Enter CyberArk credentials"
+
+$LogonURL = "$PVWAURL/API/auth/$AuthType/Logon"
+
+$Body = @{
+    username = $Credential.UserName
+    password = $Credential.GetNetworkCredential().Password
+} | ConvertTo-Json
+
+try {
+    $Token = Invoke-RestMethod `
+        -Uri $LogonURL `
+        -Method Post `
+        -ContentType "application/json" `
+        -Body $Body
+
+    if (-not $Token) {
+        throw "Login succeeded but no token was returned."
+    }
+
+    $Headers = @{
+        Authorization = "$Token"
+    }
+
+    Write-Host "Login successful." -ForegroundColor Green
+}
+catch {
+    Write-Error "Login failed: $($_.Exception.Message)"
+    exit 1
+}
+finally {
+    $Body = $null
+    $Credential = $null
+}
+
+# --- Validate CSV ---
+if (-not (Test-Path $CSVPath)) {
+    Write-Error "CSV file not found: $CSVPath"
+    exit 1
+}
+
+$Accounts = @(Import-Csv $CSVPath)
+
+if ($Accounts.Count -eq 0) {
+    Write-Error "CSV is empty."
+    exit 1
+}
+
+$Results = @()
+$Counter = 0
+
+Write-Host "Processing $($Accounts.Count) account(s)..." -ForegroundColor Yellow
+
+foreach ($Row in $Accounts) {
+    $Counter++
+
+    $name = ($Row.name).Trim()
+    $safe = ($Row.safe).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace($safe)) {
+        Write-Host "[$Counter/$($Accounts.Count)] Skipped - missing name or safe" -ForegroundColor Yellow
+
+        $Results += [PSCustomObject]@{
+            name      = $name
+            safe      = $safe
+            AccountID = "N/A"
+            Status    = "Skipped - Missing name or safe"
+            Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        }
+
+        continue
+    }
+
+    Write-Host "[$Counter/$($Accounts.Count)] Searching account '$name' in safe '$safe'..." -NoNewline
+
+    try {
+        $encodedSearch = [System.Web.HttpUtility]::UrlEncode($name)
+        $encodedFilter = [System.Web.HttpUtility]::UrlEncode("safeName eq $safe")
+
+        $SearchURL = "$PVWAURL/API/Accounts?search=$encodedSearch&filter=$encodedFilter"
+
+        $SearchResponse = Invoke-RestMethod `
+            -Uri $SearchURL `
+            -Method Get `
+            -Headers $Headers `
+            -ContentType "application/json"
+
+        $MatchedAccount = @($SearchResponse.value | Where-Object {
+            $_.name -eq $name -and $_.safeName -eq $safe
+        })
+
+        if ($MatchedAccount.Count -eq 0) {
+            Write-Host " Not found" -ForegroundColor Red
+
+            $Results += [PSCustomObject]@{
+                name      = $name
+                safe      = $safe
+                AccountID = "N/A"
+                Status    = "Not Found"
+                Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
+
+            continue
+        }
+
+        if ($MatchedAccount.Count -gt 1) {
+            Write-Host " Multiple matches found. Skipped." -ForegroundColor Yellow
+
+            $Results += [PSCustomObject]@{
+                name      = $name
+                safe      = $safe
+                AccountID = "N/A"
+                Status    = "Skipped - Multiple Matches"
+                Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
+
+            continue
+        }
+
+        $AccountID = $MatchedAccount[0].id
+
+        Invoke-RestMethod `
+            -Uri "$PVWAURL/API/Accounts/$AccountID/" `
+            -Method Delete `
+            -Headers $Headers `
+            -ContentType "application/json"
+
+        Write-Host " Deleted. Account ID: $AccountID" -ForegroundColor Green
+
+        $Results += [PSCustomObject]@{
+            name      = $name
+            safe      = $safe
+            AccountID = $AccountID
+            Status    = "Deleted"
+            Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        }
+    }
+    catch {
+        Write-Host " Error: $($_.Exception.Message)" -ForegroundColor Red
+
+        $Results += [PSCustomObject]@{
+            name      = $name
+            safe      = $safe
+            AccountID = "N/A"
+            Status    = "Error: $($_.Exception.Message)"
+            Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        }
+    }
+}
+
+# --- Export Log ---
+$Results | Export-Csv -Path $LogFile -NoTypeInformation
+
+Write-Host "`nLog exported: $LogFile" -ForegroundColor Cyan
+
+# --- Summary ---
+Write-Host "`n=== SUMMARY ===" -ForegroundColor Cyan
+Write-Host "Deleted  : $(($Results | Where-Object {$_.Status -eq 'Deleted'}).Count)" -ForegroundColor Green
+Write-Host "Not Found: $(($Results | Where-Object {$_.Status -eq 'Not Found'}).Count)" -ForegroundColor Red
+Write-Host "Skipped  : $(($Results | Where-Object {$_.Status -like 'Skipped*'}).Count)" -ForegroundColor Yellow
+Write-Host "Errors   : $(($Results | Where-Object {$_.Status -like 'Error*'}).Count)" -ForegroundColor Red
+
+# --- Logout ---
+try {
+    Write-Host "`nLogging out..." -ForegroundColor Cyan
+
+    Invoke-RestMethod `
+        -Uri "$PVWAURL/API/auth/Logoff" `
+        -Method Post `
+        -Headers $Headers `
+        -ContentType "application/json"
+
+    Write-Host "Session closed." -ForegroundColor Green
+}
+catch {
+    Write-Warning "Logout failed: $($_.Exception.Message)"
+}
