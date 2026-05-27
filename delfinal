@@ -1,7 +1,7 @@
 # --- Configuration ---
-$PVWAURL  = "https://your-pvwa-server.domain.com/PasswordVault"
-$CSVPath  = "C:\scripts\accounts_to_delete.csv"
-$LogFile  = "C:\scripts\delete_log_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$PVWAURL = "https://your-pvwa-server.domain.com/PasswordVault"
+$CSVPath = "C:\scripts\accounts_to_delete.csv"
+$LogFile = "C:\scripts\delete_log_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 
 # --- 1. Login to CyberArk ---
 Write-Host "Authenticating to CyberArk..." -ForegroundColor Cyan
@@ -14,8 +14,9 @@ if (-not $Credential) {
 
 $LogonURL = "$PVWAURL/API/auth/Cyberark/Logon"
 $Body = @{
-    username = $Credential.UserName
-    password = $Credential.GetNetworkCredential().Password
+    username          = $Credential.UserName
+    password          = $Credential.GetNetworkCredential().Password
+    concurrentSession = $true
 } | ConvertTo-Json
 
 try {
@@ -24,11 +25,14 @@ try {
     Write-Host "Login Successful." -ForegroundColor Green
 }
 catch {
-    Write-Error "Login Failed: $($_.Exception.Message)"
+    $errMsg = $_.Exception.Message
+    if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = $_.ErrorDetails.Message }
+    Write-Error "Login Failed: $errMsg"
+    Write-Host "Tip: If using AD credentials change LogonURL to /API/auth/LDAP/Logon" -ForegroundColor Yellow
     exit
 }
 finally {
-    $Body = $null
+    $Body       = $null
     $Credential = $null
 }
 
@@ -42,80 +46,113 @@ if (Test-Path $CSVPath) {
 
     foreach ($Row in $Accounts) {
         $Counter++
-        $name     = $Row.name
-        $safe     = $Row.safe
-        $address  = $Row.address
-        $userName = $Row.userName
+        $name = "$($Row.name)".Trim()
+        $safe = "$($Row.safe)".Trim()
 
         Write-Host "[$Counter/$($Accounts.Count)] Searching: $name in Safe: $safe..." -NoNewline
 
-        # Build search query using correct CyberArk API filter syntax
-        $SearchFilter = "search=$userName $address"
-        if ($safe) { $SearchFilter += "&filter=safeName eq $safe" }
-        $SearchURL = "$PVWAURL/API/Accounts?$SearchFilter"
+        # Skip rows with blank name or safe
+        if (-not $name -or -not $safe) {
+            Write-Host " Skipped (blank name or safe)" -ForegroundColor Yellow
+            $Results += [PSCustomObject]@{
+                name      = $name
+                safe      = $safe
+                AccountID = "N/A"
+                Status    = "Skipped - blank name or safe"
+                Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
+            continue
+        }
+
+        # Build search URL using the most distinctive token from the name
+        # Strip trailing "(1)", "(2)" suffix then take the last meaningful word
+        $searchSeed = $name -replace '\s*\(\d+\)\s*$', ''
+        $tokens     = @($searchSeed -split '[-.\s]' | Where-Object { $_ -match '^\w+$' -and $_.Length -gt 2 })
+        $searchKey  = if ($tokens.Count -gt 0) { $tokens[-1] } else { $searchSeed }
+
+        $encSearch = [System.Uri]::EscapeDataString($searchKey)
+        $encFilter = [System.Uri]::EscapeDataString("safeName eq $safe")
+        $SearchURL = "$PVWAURL/API/Accounts?search=$encSearch&filter=$encFilter&limit=1000"
 
         try {
             $SearchResponse = Invoke-RestMethod -Uri $SearchURL -Method Get -Headers $Headers
 
-            # Filter for exact match
+            # Exact match on name and safe only - name is unique per safe in CyberArk
             $MatchedAccount = @($SearchResponse.value | Where-Object {
-                (-not $name     -or $_.name     -eq $name)     -and
-                (-not $safe     -or $_.safeName -eq $safe)     -and
-                (-not $address  -or $_.address  -eq $address)  -and
-                (-not $userName -or $_.userName -eq $userName)
+                $_.name     -eq $name -and
+                $_.safeName -eq $safe
             })
 
-            if ($MatchedAccount.Count -gt 0) {
-                if ($MatchedAccount.Count -gt 1) {
-                    Write-Host " Multiple matches ($($MatchedAccount.Count)). Skipping." -ForegroundColor Yellow
-                    $Results += [PSCustomObject]@{
-                        name      = $name
-                        safe      = $safe
-                        address   = $address
-                        userName  = $userName
-                        AccountID = "N/A"
-                        Status    = "Skipped - Multiple Matches"
-                        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                    }
-                    continue
-                }
+            Write-Host " [Match: $($MatchedAccount.Count)]" -ForegroundColor Magenta -NoNewline
 
-                $AccountID = $MatchedAccount[0].id
-                Invoke-RestMethod -Uri "$PVWAURL/API/Accounts/$AccountID" -Method Delete -Headers $Headers
-                Write-Host " Deleted (ID: $AccountID)" -ForegroundColor Green
-
-                $Results += [PSCustomObject]@{
-                    name      = $name
-                    safe      = $safe
-                    address   = $address
-                    userName  = $userName
-                    AccountID = $AccountID
-                    Status    = "Deleted"
-                    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                }
-            }
-            else {
+            if ($MatchedAccount.Count -eq 0) {
                 Write-Host " Not Found" -ForegroundColor Red
                 $Results += [PSCustomObject]@{
                     name      = $name
                     safe      = $safe
-                    address   = $address
-                    userName  = $userName
                     AccountID = "N/A"
                     Status    = "Not Found"
                     Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                 }
+                continue
             }
-        }
-        catch {
-            Write-Host " Error: $($_.Exception.Message)" -ForegroundColor Red
+
+            if ($MatchedAccount.Count -gt 1) {
+                Write-Host " Multiple matches ($($MatchedAccount.Count)) - skipping" -ForegroundColor Yellow
+                $Results += [PSCustomObject]@{
+                    name      = $name
+                    safe      = $safe
+                    AccountID = "N/A"
+                    Status    = "Skipped - Multiple Matches ($($MatchedAccount.Count))"
+                    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                }
+                continue
+            }
+
+            # Exactly one match
+            $AccountID = $MatchedAccount[0].id
+
+            # Guard - never DELETE without a valid AccountID
+            if ([string]::IsNullOrWhiteSpace($AccountID)) {
+                Write-Host " AccountID empty - skipping" -ForegroundColor Yellow
+                $Results += [PSCustomObject]@{
+                    name      = $name
+                    safe      = $safe
+                    AccountID = "N/A"
+                    Status    = "Skipped - Empty AccountID returned from search"
+                    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                }
+                continue
+            }
+
+            # Perform deletion
+            Invoke-RestMethod -Uri "$PVWAURL/API/Accounts/$AccountID" -Method Delete -Headers $Headers | Out-Null
+            Write-Host " Deleted (ID: $AccountID)" -ForegroundColor Green
+
             $Results += [PSCustomObject]@{
                 name      = $name
                 safe      = $safe
-                address   = $address
-                userName  = $userName
+                AccountID = $AccountID
+                Status    = "Deleted"
+                Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
+        }
+        catch {
+            $errMsg = $_.Exception.Message
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                try {
+                    $parsed = $_.ErrorDetails.Message | ConvertFrom-Json
+                    $errMsg = "CyberArk [$($parsed.ErrorCode)]: $($parsed.ErrorMessage)"
+                } catch {
+                    $errMsg = $_.ErrorDetails.Message
+                }
+            }
+            Write-Host " Error: $errMsg" -ForegroundColor Red
+            $Results += [PSCustomObject]@{
+                name      = $name
+                safe      = $safe
                 AccountID = "N/A"
-                Status    = "Error: $($_.Exception.Message)"
+                Status    = "Error: $errMsg"
                 Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             }
         }
@@ -130,12 +167,21 @@ else {
 
 # --- 3. Summary ---
 Write-Host "`n=== SUMMARY ===" -ForegroundColor Cyan
-Write-Host "Deleted  : $(($Results | Where-Object {$_.Status -eq 'Deleted'}).Count)"   -ForegroundColor Green
-Write-Host "Not Found: $(($Results | Where-Object {$_.Status -eq 'Not Found'}).Count)" -ForegroundColor Red
-Write-Host "Skipped  : $(($Results | Where-Object {$_.Status -like 'Skipped*'}).Count)" -ForegroundColor Yellow
-Write-Host "Errors   : $(($Results | Where-Object {$_.Status -like 'Error*'}).Count)"  -ForegroundColor Red
+Write-Host "Deleted  : $(($Results | Where-Object { $_.Status -eq 'Deleted'         }).Count)" -ForegroundColor Green
+Write-Host "Not Found: $(($Results | Where-Object { $_.Status -eq 'Not Found'       }).Count)" -ForegroundColor Red
+Write-Host "Skipped  : $(($Results | Where-Object { $_.Status -like 'Skipped*'      }).Count)" -ForegroundColor Yellow
+Write-Host "Errors   : $(($Results | Where-Object { $_.Status -like 'Error*'        }).Count)" -ForegroundColor Red
+Write-Host "Total    : $($Accounts.Count)"
 
 # --- 4. Logout ---
 Write-Host "`nLogging out..." -ForegroundColor Cyan
-Invoke-RestMethod -Uri "$PVWAURL/API/auth/Logoff" -Method Post -Headers $Headers
-Write-Host "Session closed." -ForegroundColor Green
+try {
+    Invoke-RestMethod -Uri "$PVWAURL/API/auth/Logoff" -Method Post -Headers $Headers | Out-Null
+    Write-Host "Session closed." -ForegroundColor Green
+}
+catch {
+    Write-Host "Logout warning: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+finally {
+    $Headers = $null
+}
