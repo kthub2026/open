@@ -1,9 +1,12 @@
 # --- Configuration ---
-$PVWAURL  = "https:///PasswordVault"
+$PVWAURL  = ""
 $CSVPath  = ""
 $Username = ""
 $Password = ""
-$LogFile  = "\delete_log_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$LogFile  = ""
+
+# CSV Headers Expected:
+# name,safe,accountid
 
 # --- 1. Login to CyberArk ---
 Write-Host "Authenticating to CyberArk..." -ForegroundColor Green
@@ -24,7 +27,7 @@ catch {
     exit
 }
 
-# --- 2. Process CSV and Search/Delete ---
+# --- 2. Process CSV and Delete by AccountID ---
 $Results = @()
 
 if (Test-Path $CSVPath) {
@@ -36,79 +39,37 @@ if (Test-Path $CSVPath) {
     foreach ($Row in $Accounts) {
 
         $Counter++
-        $name     = $Row.name
-        $safe     = $Row.safe
-        $address  = $Row.address
-        $userName = $Row.userName
+        $name      = $Row.name
+        $safe      = $Row.safe
+        $accountid = $Row.accountid
 
-        Write-Host "[$Counter/$($Accounts.Count)] Searching: $name in Safe: $safe..." -NoNewline
+        Write-Host "[$Counter/$($Accounts.Count)] Deleting: $name in Safe: $safe AccountID: $accountid..." -NoNewline
 
-        # Build search query
-        $SearchFilter = "search=$userName $address"
+        if ([string]::IsNullOrWhiteSpace($accountid)) {
+            Write-Host " Skipped - Missing AccountID" -ForegroundColor Yellow
 
-        if ($safe) {
-            $SearchFilter = "$SearchFilter&filter=safeName eq $safe"
+            $Results += [PSCustomObject]@{
+                name      = $name
+                safe      = $safe
+                AccountID = "N/A"
+                Status    = "Skipped - Missing AccountID"
+                Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
+
+            continue
         }
 
-        $SearchURL = "$PVWAURL/API/Accounts?$SearchFilter"
-
         try {
-            $SearchResponse = Invoke-RestMethod -Uri $SearchURL -Method Get -Headers $Headers
+            Invoke-RestMethod -Uri "$PVWAURL/API/Accounts/$accountid" -Method Delete -Headers $Headers
 
-            # Exact match validation
-            $MatchedAccount = $SearchResponse.value | Where-Object {
-                (-not $name     -or $_.name     -eq $name)     -and
-                (-not $safe     -or $_.safeName -eq $safe)     -and
-                (-not $address  -or $_.address  -eq $address)  -and
-                (-not $userName -or $_.userName -eq $userName)
-            }
+            Write-Host " Deleted" -ForegroundColor Green
 
-            if ($MatchedAccount) {
-
-                if ($MatchedAccount.Count -gt 1) {
-                    Write-Host " Multiple matches ($($MatchedAccount.Count)). Skipping." -ForegroundColor Yellow
-
-                    $Results += [PSCustomObject]@{
-                        name      = $name
-                        safe      = $safe
-                        address   = $address
-                        userName  = $userName
-                        AccountID = "N/A"
-                        Status    = "Skipped - Multiple Matches"
-                        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                    }
-
-                    continue
-                }
-
-                $AccountID = $MatchedAccount.id
-
-                Invoke-RestMethod -Uri "$PVWAURL/API/Accounts/$AccountID" -Method Delete -Headers $Headers
-
-                Write-Host " Deleted (ID: $AccountID)" -ForegroundColor Green
-
-                $Results += [PSCustomObject]@{
-                    name      = $name
-                    safe      = $safe
-                    address   = $address
-                    userName  = $userName
-                    AccountID = $AccountID
-                    Status    = "Deleted"
-                    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                }
-            }
-            else {
-                Write-Host " Not Found" -ForegroundColor Red
-
-                $Results += [PSCustomObject]@{
-                    name      = $name
-                    safe      = $safe
-                    address   = $address
-                    userName  = $userName
-                    AccountID = "N/A"
-                    Status    = "Not Found"
-                    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                }
+            $Results += [PSCustomObject]@{
+                name      = $name
+                safe      = $safe
+                AccountID = $accountid
+                Status    = "Deleted"
+                Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             }
         }
         catch {
@@ -117,9 +78,7 @@ if (Test-Path $CSVPath) {
             $Results += [PSCustomObject]@{
                 name      = $name
                 safe      = $safe
-                address   = $address
-                userName  = $userName
-                AccountID = "N/A"
+                AccountID = $accountid
                 Status    = "Error: $($_.Exception.Message)"
                 Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             }
@@ -136,7 +95,6 @@ else {
 # --- 3. Summary ---
 Write-Host "`n=== SUMMARY ===" -ForegroundColor Cyan
 Write-Host "Deleted   : $(($Results | Where-Object { $_.Status -eq 'Deleted' }).Count)" -ForegroundColor Green
-Write-Host "Not Found : $(($Results | Where-Object { $_.Status -eq 'Not Found' }).Count)" -ForegroundColor Red
 Write-Host "Skipped   : $(($Results | Where-Object { $_.Status -like 'Skipped*' }).Count)" -ForegroundColor Yellow
 Write-Host "Errors    : $(($Results | Where-Object { $_.Status -like 'Error*' }).Count)" -ForegroundColor Red
 
